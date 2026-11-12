@@ -9,8 +9,9 @@
 //  guards, killer/counter/continuation/capture history, and four
 //  static-eval correction histories (pawn, previous-move,
 //  non-pawn placement, pawn-king). NNUE 768->768x2->1 (gen8 net,
-//  onyx.nnue) with fused AVX2 accumulator updates and a PeSTO
-//  classical fallback. All constants machine-tuned via SPSA
+//  onyx.nnue) with fused AVX2/AArch64 NEON accumulator updates,
+//  optional runtime SDOT output evaluation, and a PeSTO classical
+//  fallback. All constants machine-tuned via SPSA
 //  match play; every change SPRT-gated (~45 experiments; see the
 //  repo's EXPERIMENT_LOG.md for the complete accept/reject
 //  history, including 2.0's twelve accepted changes:
@@ -274,20 +275,127 @@ static inline int featIdx(int persp, int pc, int sq) {
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
+#endif
+#endif
+
+// Dotprod is optional on AArch64. It is enabled only after runtime CPU
+// detection and a full range check of the loaded network's output weights.
+bool nnDotprodEnabled = false;
+static bool nnCpuHasDotprod() {
+#if defined(__aarch64__) && defined(__linux__)
+    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#else
+    return false;
+#endif
+}
+
 static inline void nnAddFeature(Accumulator &acc, int pc, int sq) {
     const int16_t *w0 = nnW1[featIdx(WHITE, pc, sq)];
     const int16_t *w1 = nnW1[featIdx(BLACK, pc, sq)];
+#if defined(__aarch64__)
+    for (int i = 0; i < nnHidden; i += 8) {
+        vst1q_s16(&acc.v[WHITE][i], vaddq_s16(vld1q_s16(&acc.v[WHITE][i]), vld1q_s16(&w0[i])));
+        vst1q_s16(&acc.v[BLACK][i], vaddq_s16(vld1q_s16(&acc.v[BLACK][i]), vld1q_s16(&w1[i])));
+    }
+#else
     for (int i = 0; i < nnHidden; i++) acc.v[WHITE][i] += w0[i];
     for (int i = 0; i < nnHidden; i++) acc.v[BLACK][i] += w1[i];
+#endif
 }
 void nnRefresh(Accumulator &acc, const Position &p) {
+#if defined(__aarch64__)
+    for (int i = 0; i < nnHidden; i += 8) {
+        int16x8_t bias = vld1q_s16(&nnB1[i]);
+        vst1q_s16(&acc.v[WHITE][i], bias);
+        vst1q_s16(&acc.v[BLACK][i], bias);
+    }
+#else
     for (int c = 0; c < 2; c++)
         for (int i = 0; i < nnHidden; i++) acc.v[c][i] = nnB1[i];
+#endif
     for (int pc = 0; pc < 12; pc++) {
         U64 b = p.bb[pc];
         while (b) nnAddFeature(acc, pc, poplsb(b));
     }
 }
+
+#if defined(__aarch64__)
+static inline int16x8_t nnClip8(const int16_t *src) {
+    const int16x8_t zero = vdupq_n_s16(0);
+    const int16x8_t cap = vdupq_n_s16(255);
+    return vminq_s16(vmaxq_s16(vld1q_s16(src), zero), cap);
+}
+
+// Exact NEON fallback. Products are widened and accumulated as int64 so
+// unusual but valid int16 networks cannot overflow a 32-bit lane accumulator.
+static int64_t nnEvalNeon(const int16_t *a, const int16_t *b,
+                          const int16_t *w2, int hidden) {
+    int64x2_t a0 = vdupq_n_s64(0), a1 = vdupq_n_s64(0);
+    int64x2_t b0 = vdupq_n_s64(0), b1 = vdupq_n_s64(0);
+    for (int i = 0; i < hidden; i += 8) {
+        int16x8_t va = nnClip8(a + i);
+        int16x8_t vb = nnClip8(b + i);
+        int16x8_t wa = vld1q_s16(w2 + i);
+        int16x8_t wb = vld1q_s16(w2 + hidden + i);
+        int32x4_t pa0 = vmull_s16(vget_low_s16(va), vget_low_s16(wa));
+        int32x4_t pa1 = vmull_s16(vget_high_s16(va), vget_high_s16(wa));
+        int32x4_t pb0 = vmull_s16(vget_low_s16(vb), vget_low_s16(wb));
+        int32x4_t pb1 = vmull_s16(vget_high_s16(vb), vget_high_s16(wb));
+        a0 = vaddq_s64(a0, vpaddlq_s32(pa0));
+        a1 = vaddq_s64(a1, vpaddlq_s32(pa1));
+        b0 = vaddq_s64(b0, vpaddlq_s32(pb0));
+        b1 = vaddq_s64(b1, vpaddlq_s32(pb1));
+    }
+    return vaddvq_s64(a0) + vaddvq_s64(a1)
+         + vaddvq_s64(b0) + vaddvq_s64(b1);
+}
+
+// Onyx gen8 output weights are signed int16 in the file format. When every
+// loaded output weight fits int8, split each clipped activation x into
+// signed-low-byte(x) + 256*(x >= 128). Two SDOT operations then reproduce
+// x*w exactly; no network quantization or approximation is performed.
+__attribute__((target("arch=armv8.2-a+dotprod")))
+static int64_t nnEvalDotprod(const int16_t *a, const int16_t *b,
+                             const int16_t *w2, int hidden) {
+    int32x4_t dot = vdupq_n_s32(0);
+    int32x4_t correction = vdupq_n_s32(0);
+    const int16x8_t zero = vdupq_n_s16(0);
+    const int16x8_t cap = vdupq_n_s16(255);
+    const int16x8_t threshold = vdupq_n_s16(127);
+    const int16x8_t one = vdupq_n_s16(1);
+    for (int i = 0; i < hidden; i += 16) {
+        int16x8_t av0 = vminq_s16(vmaxq_s16(vld1q_s16(a + i), zero), cap);
+        int16x8_t av1 = vminq_s16(vmaxq_s16(vld1q_s16(a + i + 8), zero), cap);
+        int16x8_t bv0 = vminq_s16(vmaxq_s16(vld1q_s16(b + i), zero), cap);
+        int16x8_t bv1 = vminq_s16(vmaxq_s16(vld1q_s16(b + i + 8), zero), cap);
+        int8x16_t ax = vcombine_s8(vmovn_s16(av0), vmovn_s16(av1));
+        int8x16_t bx = vcombine_s8(vmovn_s16(bv0), vmovn_s16(bv1));
+        int8x16_t ah = vcombine_s8(
+            vmovn_s16(vandq_s16(vcgtq_s16(av0, threshold), one)),
+            vmovn_s16(vandq_s16(vcgtq_s16(av1, threshold), one)));
+        int8x16_t bh = vcombine_s8(
+            vmovn_s16(vandq_s16(vcgtq_s16(bv0, threshold), one)),
+            vmovn_s16(vandq_s16(vcgtq_s16(bv1, threshold), one)));
+        int8x16_t wa = vcombine_s8(vmovn_s16(vld1q_s16(w2 + i)),
+                                   vmovn_s16(vld1q_s16(w2 + i + 8)));
+        int8x16_t wb = vcombine_s8(vmovn_s16(vld1q_s16(w2 + hidden + i)),
+                                   vmovn_s16(vld1q_s16(w2 + hidden + i + 8)));
+        dot = vdotq_s32(dot, ax, wa);
+        dot = vdotq_s32(dot, bx, wb);
+        correction = vdotq_s32(correction, ah, wa);
+        correction = vdotq_s32(correction, bh, wb);
+    }
+    return (int64_t)vaddvq_s32(dot) + 256LL * (int64_t)vaddvq_s32(correction);
+}
+#endif
+
 int nnEval(const Position &p, const Accumulator &acc) {
     int stm = p.side;
     int bk = nnBuckets > 1
@@ -315,6 +423,11 @@ int nnEval(const Position &p, const Accumulator &acc) {
     s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
     s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
     sum += _mm_cvtsi128_si32(s4);
+#elif defined(__aarch64__)
+    if (nnDotprodEnabled)
+        sum += nnEvalDotprod(a, b, w2, nnHidden);
+    else
+        sum += nnEvalNeon(a, b, w2, nnHidden);
 #else
     for (int i = 0; i < nnHidden; i++) {
         int v = a[i]; v = v < 0 ? 0 : (v > 255 ? 255 : v);
@@ -357,7 +470,21 @@ bool nnLoad(const string &path) {
         ok = fread(nnW2[b], sizeof(int16_t), 2 * h, f) == 2 * (size_t)h;
     ok = ok && fread(nnB2, sizeof(int32_t), nb, f) == (size_t)nb;
     fclose(f);
-    if (ok) { nnHidden = h; nnBuckets = nb; nnueLoaded = true; }
+    if (ok) {
+        nnHidden = h;
+        nnBuckets = nb;
+        bool outputWeightsFitI8 = true;
+        for (int bucket = 0; bucket < nb && outputWeightsFitI8; bucket++) {
+            for (int i = 0; i < 2 * h; i++) {
+                if (nnW2[bucket][i] < -128 || nnW2[bucket][i] > 127) {
+                    outputWeightsFitI8 = false;
+                    break;
+                }
+            }
+        }
+        nnDotprodEnabled = outputWeightsFitI8 && nnCpuHasDotprod();
+        nnueLoaded = true;
+    }
     return ok;
 }
 
@@ -471,6 +598,17 @@ void nnApplyDelta(const AccDelta &dd, const Accumulator &src, Accumulator &dst) 
                 v = _mm256_sub_epi16(v, _mm256_load_si256((const __m256i *)&s1[i]));
                 _mm256_store_si256((__m256i *)&dp[i], v);
             }
+        }
+#elif defined(__aarch64__)
+        const int16_t *a1 = na > 1 ? nnW1[addF[c][1]] : nullptr;
+        const int16_t *s1 = ns > 1 ? nnW1[subF[c][1]] : nullptr;
+        for (int i = 0; i < nnHidden; i += 8) {
+            int16x8_t v = vld1q_s16(sp + i);
+            v = vaddq_s16(v, vld1q_s16(a0 + i));
+            if (na > 1) v = vaddq_s16(v, vld1q_s16(a1 + i));
+            v = vsubq_s16(v, vld1q_s16(s0 + i));
+            if (ns > 1) v = vsubq_s16(v, vld1q_s16(s1 + i));
+            vst1q_s16(dp + i, v);
         }
 #else
         if (na == 1 && ns == 1) {
@@ -3501,6 +3639,14 @@ int main(int argc, char **argv) {
         printf("info string NNUE loaded: onyx.nnue\n");
     else if (nnLoad("sable.nnue"))   // pre-rename folders keep working
         printf("info string NNUE loaded: sable.nnue\n");
+#if defined(__aarch64__)
+    if (nnueLoaded)
+        printf("info string NNUE backend: NEON%s\n", nnDotprodEnabled ? " + runtime SDOT" : "");
+#elif defined(__AVX2__)
+    if (nnueLoaded) printf("info string NNUE backend: AVX2\n");
+#else
+    if (nnueLoaded) printf("info string NNUE backend: scalar\n");
+#endif
     if (bookLoad("book.bin"))
         printf("info string book loaded: book.bin\n");
 

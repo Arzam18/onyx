@@ -16,8 +16,7 @@ Formerly named "Sable" (v1.0-1.7); renamed Onyx from v1.8.
 - `onyx.nnue`                - the gen8 neural network - KEEP NEXT TO THE EXE
 - `book.bin`                 - small Polyglot opening book (optional;
                                engine plays without it, UCI OwnBook toggles)
-- `src/onyx.cpp`             - complete source, one file
-- `SHA256SUMS.txt`           - artifact hashes
+- `onyx.cpp`                 - complete source, one file
 
 ## Install
 
@@ -27,9 +26,25 @@ EvalFile, plus exposed search-tuning spins (leave at defaults).
 
 ## Build from source
 
-    g++ -std=c++17 -O3 -march=native -static -pthread onyx.cpp -o onyx.exe
+Desktop x86-64:
 
-GCC 10+ on any x64 platform (Windows/Linux). AVX2 strongly recommended.
+    g++ -std=c++17 -O3 -march=native -pthread onyx.cpp -o onyx
+
+Android ARM64 (Android NDK r27c, API 24):
+
+    bash scripts/build_android_arm64.sh
+
+The Android build targets baseline ARMv8-A + NEON. The NNUE uses NEON for
+16-bit accumulator updates and exact 32-bit evaluation products. On Linux/
+Android AArch64, an SDOT output-layer kernel is selected at runtime only when
+the CPU advertises Dotprod and every loaded output weight fits signed int8.
+The SDOT kernel splits clipped activations into an exact signed-byte value
+plus a correction term; it does not quantize or modify the network. Other
+AArch64 CPUs and networks use the exact NEON path. x86-64 retains its AVX2
+backend and scalar fallback.
+
+The build workflow publishes the engine executable only. Keep `onyx.nnue`
+(and optionally `book.bin`) next to the executable, as described above.
 
 ## Strength
 
@@ -43,8 +58,10 @@ GCC 10+ on any x64 platform (Windows/Linux). AVX2 strongly recommended.
 ## Architecture (v2.0)
 
 - Bitboards with magic move generation; single-file C++17.
-- NNUE 768->768x2->1 (CReLU, int16 SIMD), fused AVX2 accumulator updates,
-  per-ply accumulator stack. Net trained with lambda-blended WDL/score
+- NNUE 768->768x2->1 (CReLU, int16 SIMD), fused AVX2 or AArch64 NEON
+  accumulator updates, per-ply accumulator stack. Runtime SDOT is available
+  for networks whose output weights fit signed int8. Net trained with
+  lambda-blended WDL/score
   targets on 97.5M self-play positions (~200M-position successor training
   in progress).
 - PVS/alpha-beta: aspiration windows, TT with depth/bound-aware same-key
